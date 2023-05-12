@@ -1,0 +1,135 @@
+import pandas as pd
+
+# Load the ratings data
+ratings = pd.read_csv('u.data', sep='\t', header=None, names=['user_id', 'item_id', 'rating', 'timestamp'])
+
+# Load the movies data
+movies = pd.read_csv('u.item', sep='|', header=None, encoding='latin-1', usecols=[0, 1], names=['item_id', 'title'])
+
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+# Convert the ratings DataFrame to a user-item interaction matrix
+n_users = ratings.user_id.nunique()
+n_items = ratings.item_id.nunique()
+user_item_matrix = np.zeros((n_users, n_items))
+for row in ratings.itertuples():
+    user_item_matrix[row[1]-1, row[2]-1] = row[3]
+
+"""# Split the data into training and validation sets
+train_matrix, val_matrix = train_test_split(user_item_matrix, test_size=0.2, random_state=42) """
+
+from sklearn.model_selection import train_test_split
+
+# Split the data into a train-validation set and a test set
+trainval_matrix, test_matrix = train_test_split(user_item_matrix, test_size=0.2, random_state=42)
+
+# Split the train-validation set into a train set and a validation set
+train_matrix, val_matrix = train_test_split(trainval_matrix, test_size=0.2, random_state=42)
+import dgl
+
+# Create the DGL graph
+g = dgl.graph(user_item_matrix.nonzero())
+import torch
+import torch.nn as nn
+import dgl.nn.pytorch as dglnn
+class SVD(nn.Module):
+    def __init__(self, num_users, num_items, emb_size):
+        super(SVD, self).__init__()
+        self.user_emb = nn.Embedding(num_users, emb_size)
+        self.item_emb = nn.Embedding(num_items, emb_size)
+        self.user_bias = nn.Embedding(num_users, 1)
+        self.item_bias = nn.Embedding(num_items, 1)
+        self.global_bias = nn.Parameter(torch.Tensor([3.5]))
+        
+    def forward(self, u, v):
+        u_emb = self.user_emb(u)
+        v_emb = self.item_emb(v)
+        u_bias = self.user_bias(u)
+        v_bias = self.item_bias(v)
+        dot = torch.sum(u_emb * v_emb, dim=1)
+        return dot + u_bias.squeeze() + v_bias.squeeze() + self.global_bias
+
+# Initialize the model
+model = SVD(n_users, n_items, 64)
+
+# Define the loss function and optimizer
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+# Train the model
+for epoch in range(100):
+    model.train()
+    ratings = train_matrix[train_matrix.nonzero()].tolist()
+    users, items = train_matrix.nonzero()
+    ratings = torch.FloatTensor(ratings)
+    users = torch.LongTensor(users)
+    items = torch.LongTensor(items)
+    optimizer.zero_grad()
+    outputs = model(users, items)
+    loss = criterion(outputs, ratings)
+    loss.backward()
+    optimizer.step()
+
+    
+    # Evaluate the model
+    model.eval()
+    with torch.no_grad():
+        val_ratings = val_matrix[val_matrix.nonzero()].tolist()
+        val_users, val_items = val_matrix.nonzero()
+        val_ratings = torch.FloatTensor(val_ratings)
+        val_users = torch.LongTensor(val_users)
+        val_items = torch.LongTensor(val_items)
+        val_outputs = model(val_users, val_items)
+        val_loss = criterion(val_outputs, val_ratings)
+        print('Epoch [{}/{}], Loss: {:.4f}, Val Loss: {:.4f}'.format(epoch+1, 100, loss.item(), val_loss.item()))
+
+
+    # Evaluate the model on the test set
+    model.eval()
+    with torch.no_grad():
+        test_ratings = test_matrix[test_matrix.nonzero()].tolist()
+        test_users, test_items = test_matrix.nonzero()
+        test_ratings = torch.FloatTensor(test_ratings)
+        test_users = torch.LongTensor(test_users)
+        test_items = torch.LongTensor(test_items)
+        test_outputs = model(test_users, test_items)
+        test_loss = criterion(test_outputs, test_ratings)
+        print('Test Loss: {:.4f}'.format(test_loss.item()))
+    
+    # Calculate the predicted ratings for the user-item pairs in the test set
+    pred_ratings = test_outputs.detach().numpy()
+
+    # Round the predicted ratings to the nearest integer
+    pred_ratings = np.round(pred_ratings)
+
+    # Clamp the predicted ratings between 1 and 5
+    pred_ratings = np.clip(pred_ratings, 1, 5)
+
+    # Convert test_ratings to a NumPy array
+    test_ratings = test_ratings.detach().numpy()
+
+    # Calculate the mean squared error (MSE) between the predicted and actual ratings
+    mse = ((pred_ratings - test_ratings)**2).mean()
+    print('MSE: {:.4f}'.format(mse))
+
+    
+item_weights = model.item_emb.weight
+user_weights = model.user_emb.weight
+item_bias = model.item_bias.weight
+user_bias = model.user_bias.weight
+
+scores = torch.mm(item_weights, user_weights.t())  # matrix multiplication
+scores += item_bias
+scores += user_bias.t()
+scores += model.global_bias.item()
+
+scores = scores.detach().numpy()
+
+for user_id in range(scores.shape[0]):
+    user_scores = scores[user_id]
+    top_items = np.argsort(-user_scores)[:10]
+    recommended_movies = movies[movies['item_id'].isin(top_items+1)]
+    print(f"Recommended movies for user {user_id}:")
+    print(recommended_movies)
+    print("--------------------------------------------------")
