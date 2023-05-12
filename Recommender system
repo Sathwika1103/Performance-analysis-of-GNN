@@ -1,0 +1,108 @@
+# recommender system 
+import numpy as np
+import pandas as pd
+import torch
+import dgl
+from dgl.nn import SAGEConv
+from sklearn.metrics.pairwise import cosine_similarity
+import torch.nn as nn
+import torch.optim as optim
+import warnings
+warnings.filterwarnings('ignore')
+
+# Load the movie ratings data
+ratings_data = pd.read_csv('u.data',delimiter="\t", header=None, names=['userId', 'movieId', 'rating','timestamp'], engine='python')
+
+# Create a graph with users and movies as nodes
+user_ids = ratings_data['userId'].unique()
+movie_ids = ratings_data['movieId'].unique()
+g = dgl.graph((ratings_data['userId'].values, ratings_data['movieId'].values))
+
+# Check if all movie IDs in the ratings data are present in the movie_ids array
+missing_movie_ids = np.setdiff1d(ratings_data['movieId'].unique(), movie_ids)
+if len(missing_movie_ids) > 0:
+    print(f"Warning: {len(missing_movie_ids)} movie IDs are missing from the movie_ids array.")
+    print(f"The missing movie IDs are: {missing_movie_ids}")
+
+# Assign features to the nodes
+g.ndata['feat'] = torch.zeros((g.num_nodes(), len(movie_ids)))
+#for i, movie_id in enumerate(movie_ids):
+#    g.nodes[movie_id].data['feat'][i] = 0
+
+# Define the model
+class MovieRecommender(torch.nn.Module):
+    def __init__(self, in_feats, hidden_feats):
+        super(MovieRecommender, self).__init__()
+        self.conv1 = SAGEConv(in_feats, hidden_feats, aggregator_type='mean')
+        self.conv2 = SAGEConv(hidden_feats, hidden_feats, aggregator_type='mean')
+
+    def forward(self, g, h):
+        h = self.conv1(g, h)
+        h = torch.nn.functional.relu(h)
+        h = self.conv2(g, h)
+        return h
+
+
+# Train the model
+num_epochs = 50
+lr = 0.01
+in_feats = len(movie_ids)
+hidden_feats = 32
+model = MovieRecommender(in_feats, hidden_feats)
+opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+movie_nodes = torch.tensor(movie_ids)  # 'movie_nodes' tensor is a one-dimensional tensor of movie IDs
+movie_mask = torch.zeros((g.num_nodes(),), dtype=torch.bool)  #'movie_mask' tensor is a boolean tensor that is True for all movie nodes and False for all user nodes.
+movie_mask[movie_nodes.to(torch.long)] = True
+
+# create a new tensor only containing ratings of nodes that are present in the graph
+node_ratings_masked = torch.zeros((g.num_nodes(),), dtype=torch.float)
+node_ratings_masked[movie_mask] = torch.from_numpy(
+    ratings_data.groupby('movieId')['rating'].mean().loc[movie_ids].values).float() # 'node_ratings_masked' that only contains the average ratings for movie nodes that are present in the graph 'g'
+
+for epoch in range(num_epochs):
+    logits = model(g, g.ndata['feat'])
+    node_mask = movie_mask.clone()  # start with a mask that includes only the movie nodes
+    user_nodes = torch.tensor(user_ids)
+    node_mask[user_nodes] = True
+    node_ratings = node_ratings_masked[node_mask]
+    logits = logits[node_mask]
+
+    node_ratings = node_ratings.reshape(-1, 1)
+    node_ratings = torch.argmax(node_ratings, dim=1)
+    loss = torch.nn.functional.cross_entropy(logits, node_ratings.to(torch.long))
+
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    print(f"Epoch {epoch + 1}, loss: {loss.item():.4f}")
+
+# Use the model to make recommendations
+user_ratings = ratings_data.groupby('userId')['rating'].agg(['mean', 'count'])
+users_to_recommend = user_ratings[user_ratings['count'] > 50].index
+
+# Get embeddings for all movies
+movie_feats = model(g, g.ndata['feat']).detach().numpy()
+
+for user_id in users_to_recommend:
+    # Get the movies rated by the user
+    user_movies = ratings_data.loc[ratings_data['userId'] == user_id, 'movieId'].values
+    
+    # Calculate the similarity between user's movies and all other movies
+    movie_similarities = cosine_similarity(movie_feats[user_movies], movie_feats)
+    
+    # Sort movies by similarity in descending order
+    movie_ids_sorted_by_similarity = np.argsort(-movie_similarities)
+    
+    # Recommend 10 movies that the user hasn't watched before
+    recommended_movies = []
+    for movie_id in movie_ids_sorted_by_similarity.flatten():
+        if movie_id not in user_movies:
+            recommended_movies.append(movie_id)
+            if len(recommended_movies) == 10:
+                break
+    
+    # Print the recommended movies for the user
+    print(f"User {user_id} might like these movies:")
+    for movie_id in recommended_movies:
+        print(f"- {movie_id}")
